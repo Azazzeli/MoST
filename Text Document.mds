@@ -1,0 +1,177 @@
+
+
+## 🔍 Структура осевой (`vCSAxis`) — из `vCSAxis.h` и `vCS_DM_Axis.h`
+
+```cpp
+class vCSAxis : public AcDbEntity {
+    // ...
+    AcDbObjectIdArray m_SegArray;       // ← сегменты: vCSSegment
+    AcDbObjectIdArray m_SupArray;       // ← опоры: vCSSupport
+    // ❗ НЕТ m_InLineArray!
+};
+```
+
+→ Опоры (`vCSSupport`) **хранятся напрямую в осевой** — `vCSAxis::appendSupport()` → `m_SupArray.append(id)`.
+
+А **инлайны — нет**.
+
+---
+
+## 📦 Где же хранятся `vCSInLine`?
+
+Вот истина:
+
+| Объект | Где хранится ссылка | Кто отвечает за lifecycle |
+|--------|---------------------|----------------------------|
+| `vCSSegment` | `vCSAxis::m_SegArray` | `vCSAxis` |
+| `vCSSupport` | `vCSAxis::m_SupArray` | `vCSAxis` |
+| `vCSInLine` | **`vCSSegment::m_InLineArray`** | **`vCSSegment`** |
+
+Из `vCSSegment.h`:
+```cpp
+class vCSSegment : public AcDbEntity {
+    // ...
+    AcDbObjectIdArray m_InLineArray;    // ← ТОЛЬКО здесь!
+    void insertInlineItem(const AcDbObjectId& id, int nPos = -1, AcDb::DuplicateRecordCloning = AcDb::kDrcIgnore);
+};
+```
+
+→ **`vCSInLine` — дочерний элемент `vCSSegment`, а не `vCSAxis`**.
+
+---
+
+## 🔄 Как это работает на практике?
+
+### ✅ Опора (`vCSSupport`)
+1. Ты создаёшь `vCSSupport *pSup = new vCSSupport();`
+2. `pSup->postToDb(...)`
+3. `pAxis->appendSupport(idSup)` → осевая берёт владение
+4. При `pAxis->worldDraw()` → отрисовывает **и сегменты, и опоры**
+5. При `pAxis->detachFromDatabase()` → осевая удаляет все сегменты и опоры
+
+→ **Всё стабильно**, потому что `vCSAxis` знает про опоры.
+
+---
+
+### ❌ Инлайн (`vCSInLine`)
+1. Ты создаёшь `vCSInLine *pIL = new vCSInLine();`
+2. `pIL->postToDb(...)`
+3. ...и **ничего не регистрируешь** в `vCSSegment::m_InLineArray`
+4. При `pAxis->worldDraw()`:
+   - осевая **не знает** про `pIL`
+   - но `vCSSegment::worldDraw()` **должен** вызвать `pIL->worldDraw()` для каждого `id` из `m_InLineArray`
+   - → `m_InLineArray` пуст → инлайн **не рисуется**, но…
+5. При `acedSSGet()` или `gripPoints`:
+   - AutoCAD находит `vCSInLine` в базе
+   - вызывает `pIL->getGripPoints()`
+   - внутри: `GetStartPoint()` → `GetAxis()->GetNodeAt(m_nNodeIndex)`  
+     но `m_nNodeIndex == -1` (не инициализирован!) → разыменование `nullptr` → **краш**
+
+---
+
+## ✅ Как сделать `vCSInLine` — **по-настоящему низкоуровнево, но безопасно**
+
+Тебе **не нужно** `vCSDragManager`, **не нужно** XML — только **правильная привязка к сегменту**.
+
+
+
+```cpp
+bool CreateInlineLowLevel(
+    const AcDbObjectId& idSegment,
+    double distFromStart,
+    double dn1 = 100.0,
+    double dn2 = 100.0)
+{
+    // 1. Открыть сегмент для записи (обязательно!)
+    AcDbObjectPointer<vCSSegment> pSeg(idSegment, AcDb::kForWrite);
+    if (!pSeg.openStatus()) return false;
+
+    // 2. Создать инлайн — ВАЖНО: в конструктор передать id осевой!
+    vCSInLine* pIL = new vCSInLine(pSeg->GetAxisId());
+    // ← Это гарантирует: m_idAxis = pSeg->GetAxisId(), m_nNodeIndex = -1 (но будет проставлен при вставке)
+
+    AcDbObjectId idIL;
+    AcTransaction* pTr = acTransactionManager->startTransaction();
+    if (!pTr) { delete pIL; return false; }
+
+    pTr->addNewlyCreatedDBRObject(pIL);
+    AcDbBlockTableRecord* pBtr = nullptr;
+    acdbHostApplicationServices()->workingDatabase()
+        ->getSymbolTableRecord(pBtr, AcDb::kForWrite);
+    pBtr->appendAcDbEntity(pIL);
+    pBtr->close();
+
+    // 3. Профили — лучше через фабрику (но можно и new, если знаешь, как удалить)
+    vCSProfilePtr pProf1 = vCSDragManager::createProfile(
+        vCSProfileCircle::GetStaticClass(), dn1);
+    vCSProfilePtr pProf2 = vCSDragManager::createProfile(
+        vCSProfileCircle::GetStaticClass(), dn2);
+
+    pIL->SetProfile1(pProf1);
+    pIL->SetProfile2(pProf2);
+    pIL->SetSegmentId(idSegment);
+    pIL->SetDistanceFromPrev(distFromStart);  // ← это вызовет обновление m_nNodeIndex!
+
+    // 4. 🔑 Самый важный шаг: зарегистрировать в сегменте
+    pSeg->insertInlineItem(idIL, -1);  // -1 = в конец массива
+
+    // 5. Обновить геометрию (вызовет PE_SetPosition → построит mesh)
+    pIL->PE_Rebuild_SetPosition();
+
+    pTr->endTransaction();
+
+    acutPrintf(L"\n✅ vCSInLine создан и привязан к сегменту");
+    return true;
+}
+```
+
+---
+
+## 🔎 Почему `pIL->SetDistanceFromPrev(dist)` — критично?
+
+Внутри `vCSInLine::SetDistanceFromPrev()`:
+
+```cpp
+// vCSInLine.cpp (псевдокод)
+void vCSInLine::SetDistanceFromPrev(double d) {
+    m_dDistFromPrev = d;
+    if (!m_idSegment.isNull()) {
+        AcDbObjectPointer<vCSSegment> pSeg(m_idSegment, AcDb::kForRead);
+        if (pSeg) {
+            m_nNodeIndex = pSeg->FindNodeIndexByDistance(d); // ← вычисляет индекс узла!
+        }
+    }
+}
+```
+
+→ Без этого `m_nNodeIndex == -1` → `GetStartPoint()` → `pAxis->GetNodeAt(-1)` → `nullptr` → **краш**.
+
+---
+
+
+
+```cpp
+AcDbObjectPointer<vCSInLine> pIL(idIL, AcDb::kForRead);
+if (pIL) {
+    acutPrintf(L"\n🔹 m_idAxis = %s", pIL->GetAxisId().asOldId().toString());
+    acutPrintf(L"\n🔹 m_idSegment = %s", pIL->GetSegmentId().asOldId().toString());
+    acutPrintf(L"\n🔹 m_nNodeIndex = %d", pIL->getNodeIndex());
+    acutPrintf(L"\n🔹 m_dDistFromPrev = %.1f", pIL->GetDistanceFromPrev());
+    acutPrintf(L"\n🔹 Prof1 DN = %.1f", pIL->GetDN1());
+}
+```
+
+Если `m_nNodeIndex >= 0` и `m_idAxis/m_idSegment` не null — **всё в порядке**, краша не будет.
+
+---
+
+## 🧩 TL;DR — что ты, скорее всего, 
+
+| Действие | Твоя версия | Правильно |
+|---------|-------------|-----------|
+| Конструктор | `new vCSInLine()` | `new vCSInLine(pSeg->GetAxisId())` |
+| Привязка к сегменту | ❌ пропущено | `pSeg->insertInlineItem(idIL)` |
+| Установка расстояния | `m_dDistFromPrev = d` (напрямую) | `pIL->SetDistanceFromPrev(d)` |
+| Профили | `pIL->SetProfile1(new vCSProfileCircle(...))` | `vCSDragManager::createProfile(...)` — или `delete` в деструкторе |
+
+---
